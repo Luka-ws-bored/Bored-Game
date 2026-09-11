@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "threejs-mcp": {
+      "command": "npx.cmd",
+      "args": ["-y", "@lobehub/threejs-mcp"]
+    },
+    "context7": {
+      "command": "npx.cmd",
+      "args": ["-y", "@upstash/context7-mcp"]
+    }
+  }
+}

@@ -1,0 +1,3 @@
+Always query the Context7 MCP for documentation before introducing a new library.
+When debugging a blank canvas, use Chrome DevTools MCP to check for THREE.WebGLRenderer errors before rewriting the game state logic.
+Utilize the Sequential Thinking MCP to map out all 7 turn phases before modifying gameController.ts.

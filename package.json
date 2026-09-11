@@ -9,6 +9,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "playwright": "^1.63.0",
+    "puppeteer": "^25.10.0",
     "three": "^0.169.0"
   },
   "devDependencies": {
