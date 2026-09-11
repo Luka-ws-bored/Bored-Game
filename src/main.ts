@@ -2,18 +2,25 @@ import './style.css';
 import * as THREE from 'three';
 import {
   createInitialState,
-  moveEntity,
-  type Entity,
-  type EntityType,
   type GameState,
+  type Unit,
+  type CommanderType,
+  type UnderlingType,
+  getUnitAt,
+  getDeployTiles,
+  UNDERLING_STATS,
 } from './gameState';
+import { GameController } from './gameController';
+import { mountDashboard } from './dashboard';
 
 const TILE_SIZE = 1;
 const TILE_GAP = 0.08;
 const TILE_HEIGHT = 0.3;
-const ENTITY_HOVER_BASE = 0.8;
+const COMMANDER_BASE_Y = 0.8;
+const UNDERLING_BASE_Y = 0.12;
 
 const state: GameState = createInitialState();
+const controller = new GameController(state);
 const halfBoard = (state.gridSize * (TILE_SIZE + TILE_GAP) - TILE_GAP) / 2;
 
 function gridToWorld(gx: number, gy: number): { x: number; z: number } {
@@ -104,27 +111,27 @@ ground.position.y = -TILE_HEIGHT;
 ground.receiveShadow = true;
 scene.add(ground);
 
-const factionColors: Record<EntityType, number> = {
+const commanderColors: Record<CommanderType, number> = {
   Warlord: 0x2a2a2a,
   Necromancer: 0x1a1a22,
   Engineer: 0x8a6a2a,
 };
 
-const factionRoughness: Record<EntityType, number> = {
+const commanderRoughness: Record<CommanderType, number> = {
   Warlord: 0.9,
   Necromancer: 0.35,
   Engineer: 0.6,
 };
 
-const factionMetalness: Record<EntityType, number> = {
+const commanderMetalness: Record<CommanderType, number> = {
   Warlord: 0.1,
   Necromancer: 0.5,
   Engineer: 0.7,
 };
 
-function createEntityMesh(entity: Entity): THREE.Mesh {
+function createCommanderMesh(type: CommanderType): THREE.Mesh {
   let geo: THREE.BufferGeometry;
-  switch (entity.type) {
+  switch (type) {
     case 'Warlord':
       geo = new THREE.TetrahedronGeometry(0.38);
       break;
@@ -136,18 +143,29 @@ function createEntityMesh(entity: Entity): THREE.Mesh {
       break;
   }
   const mat = new THREE.MeshStandardMaterial({
-    color: factionColors[entity.type],
-    roughness: factionRoughness[entity.type],
-    metalness: factionMetalness[entity.type],
+    color: commanderColors[type],
+    roughness: commanderRoughness[type],
+    metalness: commanderMetalness[type],
   });
   const mesh = new THREE.Mesh(geo, mat);
   mesh.castShadow = true;
-  mesh.receiveShadow = false;
   return mesh;
 }
 
-interface EntityView {
-  entity: Entity;
+function createUnderlingMesh(_type: UnderlingType, ownerColor: number): THREE.Mesh {
+  const geo = new THREE.CylinderGeometry(0.22, 0.22, 0.18, 16);
+  const mat = new THREE.MeshStandardMaterial({
+    color: ownerColor,
+    roughness: 0.7,
+    metalness: 0.2,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = true;
+  return mesh;
+}
+
+interface UnitView {
+  unitId: number;
   mesh: THREE.Mesh;
   baseY: number;
   phase: number;
@@ -155,25 +173,60 @@ interface EntityView {
   target: THREE.Vector3;
 }
 
-const entityViews: EntityView[] = [];
+const unitViews = new Map<number, UnitView>();
 
-for (const entity of state.entities) {
-  const mesh = createEntityMesh(entity);
-  const { x, z } = gridToWorld(entity.gridX, entity.gridY);
-  const baseY = ENTITY_HOVER_BASE;
+function createViewForUnit(unit: Unit): UnitView {
+  let mesh: THREE.Mesh;
+  let baseY: number;
+
+  if (unit.kind === 'commander') {
+    mesh = createCommanderMesh(unit.type as CommanderType);
+    baseY = COMMANDER_BASE_Y;
+  } else {
+    const owner = state.players[unit.ownerId];
+    mesh = createUnderlingMesh(unit.type as UnderlingType, owner.color);
+    baseY = UNDERLING_BASE_Y;
+  }
+
+  const { x, z } = gridToWorld(unit.gridX, unit.gridY);
   mesh.position.set(x, baseY, z);
   scene.add(mesh);
-  entityViews.push({
-    entity,
+
+  return {
+    unitId: unit.id,
     mesh,
     baseY,
     phase: Math.random() * Math.PI * 2,
     rotSpeed: 0.3 + Math.random() * 0.4,
     target: new THREE.Vector3(x, baseY, z),
-  });
+  };
 }
 
-let selectedView: EntityView | null = null;
+function reconcileUnits(): void {
+  const currentIds = new Set(state.units.map((u) => u.id));
+
+  for (const [id, view] of unitViews) {
+    if (!currentIds.has(id)) {
+      scene.remove(view.mesh);
+      view.mesh.geometry.dispose();
+      (view.mesh.material as THREE.Material).dispose();
+      unitViews.delete(id);
+    }
+  }
+
+  for (const unit of state.units) {
+    let view = unitViews.get(unit.id);
+    if (!view) {
+      view = createViewForUnit(unit);
+      unitViews.set(unit.id, view);
+    }
+    const { x, z } = gridToWorld(unit.gridX, unit.gridY);
+    view.target.x = x;
+    view.target.z = z;
+  }
+}
+
+reconcileUnits();
 
 const raycastPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 const raycaster = new THREE.Raycaster();
@@ -191,6 +244,35 @@ const hoverGeo = new THREE.BoxGeometry(TILE_SIZE, TILE_HEIGHT * 1.02, TILE_SIZE)
 const hoverMesh = new THREE.Mesh(hoverGeo, hoverMat);
 hoverMesh.visible = false;
 scene.add(hoverMesh);
+
+const deployHighlightMat = new THREE.MeshBasicMaterial({
+  color: 0x44ff88,
+  transparent: true,
+  opacity: 0.15,
+});
+const deployHighlights: THREE.Mesh[] = [];
+
+function clearDeployHighlights(): void {
+  for (const m of deployHighlights) {
+    scene.remove(m);
+    m.geometry.dispose();
+  }
+  deployHighlights.length = 0;
+}
+
+function showDeployHighlights(): void {
+  clearDeployHighlights();
+  if (state.phase !== 'DEPLOY') return;
+  const tiles = getDeployTiles(state, controller.activePlayer.id);
+  for (const t of tiles) {
+    const geo = new THREE.BoxGeometry(TILE_SIZE * 0.9, 0.02, TILE_SIZE * 0.9);
+    const m = new THREE.Mesh(geo, deployHighlightMat.clone());
+    const { x, z } = gridToWorld(t.x, t.y);
+    m.position.set(x, 0.02, z);
+    scene.add(m);
+    deployHighlights.push(m);
+  }
+}
 
 function onPointerMove(e: MouseEvent) {
   const rect = renderer.domElement.getBoundingClientRect();
@@ -210,6 +292,13 @@ function onPointerMove(e: MouseEvent) {
   hoverMesh.visible = false;
 }
 
+function flashSelect(view: UnitView) {
+  const mat = view.mesh.material as THREE.MeshStandardMaterial;
+  const orig = mat.emissive.getHex();
+  mat.emissive.setHex(0x444466);
+  setTimeout(() => mat.emissive.setHex(orig), 250);
+}
+
 function onCanvasClick(e: MouseEvent) {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
@@ -221,45 +310,76 @@ function onCanvasClick(e: MouseEvent) {
   if (gridX < 0 || gridX >= state.gridSize || gridY < 0 || gridY >= state.gridSize)
     return;
 
-  const clickedEntity = state.entities.find(
-    (en) => en.gridX === gridX && en.gridY === gridY,
-  );
+  const clickedUnit = getUnitAt(state, gridX, gridY);
+  const phase = state.phase;
+  const activePlayer = controller.activePlayer;
 
-  if (clickedEntity) {
-    const view = entityViews.find((v) => v.entity.id === clickedEntity.id);
-    if (view) {
-      selectedView = view;
-      flashSelect(view);
+  if (phase === 'DEPLOY') {
+    if (clickedUnit) {
+      controller.selectUnit(clickedUnit);
+      const view = unitViews.get(clickedUnit.id);
+      if (view) flashSelect(view);
+      return;
+    }
+    const result = controller.deploy(gridX, gridY);
+    if (result.ok && result.unit) {
+      spawnDamagePopup(hit, `+${UNDERLING_STATS[result.unit.type as UnderlingType].cost}`, 0x44ff88);
+    } else if (result.reason) {
+      spawnDamagePopup(hit, result.reason, 0xff6666);
     }
     return;
   }
 
-  if (selectedView) {
-    moveEntity(state, selectedView.entity.id, gridX, gridY);
-    const { x, z } = gridToWorld(gridX, gridY);
-    selectedView.target.x = x;
-    selectedView.target.z = z;
-    spawnDamagePopup(hit, '-10');
-    selectedView = null;
-  } else {
-    spawnDamagePopup(hit, '-10');
+  if (phase === 'MOVE') {
+    if (clickedUnit) {
+      if (clickedUnit.ownerId === activePlayer.id) {
+        controller.selectUnit(clickedUnit);
+        const view = unitViews.get(clickedUnit.id);
+        if (view) flashSelect(view);
+      }
+      return;
+    }
+    const selected = controller.getSelectedUnit();
+    if (selected) {
+      const ok = controller.moveUnit(selected, gridX, gridY);
+      if (ok) {
+        controller.selectUnit(null);
+      }
+    }
+    return;
+  }
+
+  if (phase === 'ACTION') {
+    if (clickedUnit) {
+      const selected = controller.getSelectedUnit();
+      if (selected && clickedUnit.ownerId !== activePlayer.id) {
+        const result = controller.attack(selected, clickedUnit);
+        if (result.ok && result.damage !== undefined) {
+          const color = result.killed ? 0xff0000 : 0xff4444;
+          spawnDamagePopup(hit, `-${result.damage}`, color);
+        } else if (result.reason) {
+          spawnDamagePopup(hit, result.reason, 0xff6666);
+        }
+      } else if (clickedUnit.ownerId === activePlayer.id) {
+        controller.selectUnit(clickedUnit);
+        const view = unitViews.get(clickedUnit.id);
+        if (view) flashSelect(view);
+      }
+    }
+    return;
   }
 }
 
-function flashSelect(view: EntityView) {
-  const mat = view.mesh.material as THREE.MeshStandardMaterial;
-  const orig = mat.emissive.getHex();
-  mat.emissive.setHex(0x444466);
-  setTimeout(() => mat.emissive.setHex(orig), 250);
-}
-
-function spawnDamagePopup(worldPos: THREE.Vector3, text: string) {
+function spawnDamagePopup(worldPos: THREE.Vector3, text: string, color: number) {
   const screen = worldToScreen(worldPos);
   const div = document.createElement('div');
   div.className = 'damage-popup';
   div.textContent = text;
   div.style.left = `${screen.x}px`;
   div.style.top = `${screen.y}px`;
+  const hex = `#${color.toString(16).padStart(6, '0')}`;
+  div.style.color = hex;
+  div.style.textShadow = `0 0 8px ${hex}99, 0 2px 4px rgba(0,0,0,0.8)`;
   overlay.appendChild(div);
   setTimeout(() => div.remove(), 1200);
 }
@@ -274,30 +394,44 @@ function worldToScreen(worldPos: THREE.Vector3): { x: number; y: number } {
   };
 }
 
-const hud = document.createElement('div');
-hud.className = 'hud';
-hud.innerHTML = `
-  <h1>Tactical Board</h1>
-  <div>Warlord &middot; Necromancer &middot; Engineer</div>
-  <div class="hint">Click a piece to select, then click a tile to move.</div>
-`;
-overlay.appendChild(hud);
+mountDashboard(controller, overlay);
+
+controller.subscribe((event) => {
+  if (event.type === 'state-changed' || event.type === 'phase-changed') {
+    reconcileUnits();
+    showDeployHighlights();
+  }
+  if (event.type === 'unit-selected' && event.unit) {
+    const view = unitViews.get(event.unit.id);
+    if (view) flashSelect(view);
+  }
+});
+
+showDeployHighlights();
 
 const clock = new THREE.Clock();
 const hoverSpeed = 1.5;
 const hoverAmplitude = 0.12;
+const underlingHoverSpeed = 2.0;
+const underlingHoverAmplitude = 0.04;
 
 function animate() {
   requestAnimationFrame(animate);
   const t = clock.getElapsedTime();
 
-  for (const view of entityViews) {
+  for (const view of unitViews.values()) {
     view.mesh.position.x = THREE.MathUtils.lerp(view.mesh.position.x, view.target.x, 0.1);
     view.mesh.position.z = THREE.MathUtils.lerp(view.mesh.position.z, view.target.z, 0.1);
-    view.mesh.position.y =
-      view.baseY + Math.sin(t * hoverSpeed + view.phase) * hoverAmplitude;
-    view.mesh.rotation.y += 0.008 * view.rotSpeed * 60 * (1 / 60);
-    view.mesh.rotation.x += 0.003 * view.rotSpeed;
+
+    const isCommander = view.baseY === COMMANDER_BASE_Y;
+    const speed = isCommander ? hoverSpeed : underlingHoverSpeed;
+    const amp = isCommander ? hoverAmplitude : underlingHoverAmplitude;
+    view.mesh.position.y = view.baseY + Math.sin(t * speed + view.phase) * amp;
+
+    view.mesh.rotation.y += 0.008 * view.rotSpeed;
+    if (isCommander) {
+      view.mesh.rotation.x += 0.003 * view.rotSpeed;
+    }
   }
 
   renderer.render(scene, camera);
